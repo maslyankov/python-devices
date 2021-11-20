@@ -134,6 +134,7 @@ class ADBDevice(Device):
         self.adb = client
         self.scrcpy: list[Popen] = list()
 
+        self.is_rooted: bool = False
         self.root()  # Make sure we are using root for device
 
         self.d = self.adb.client.device(device_serial)  # Create device client object
@@ -163,7 +164,10 @@ class ADBDevice(Device):
         """
         logging.log(logging.INFO, f"Rooting device {self.device_serial}")
 
-        self.adb.root(self.device_serial)
+        try:
+            self.is_rooted = self.adb.root(self.device_serial)
+        except ValueError as e:
+            logging.log(logging.ERROR, e)
 
     def remount(self):
         """

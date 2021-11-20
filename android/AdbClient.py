@@ -243,7 +243,7 @@ class AdbClient(Client.Client):
 
         return self.attach_device(device_serial)
 
-    def root(self, device_serial: str) -> None:
+    def root(self, device_serial: str) -> bool:
         """
         Root the device
         :return:None
@@ -277,6 +277,8 @@ class AdbClient(Client.Client):
                     logging.log(logging.INFO, "Rooting Output: {}".format(stdout.decode()))
 
                 root.terminate()
+
+                return True
             except FileNotFoundError:
                 logging.log(logging.CRITICAL, f"Could not find ADB")
 
