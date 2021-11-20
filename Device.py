@@ -1,9 +1,12 @@
 import os
 import logging
 import xml.etree.cElementTree as ET
+import pathlib
+
 
 DEVICES_SETTINGS_DIR = 'devices'
-Path(DEVICES_SETTINGS_DIR).mkdir(parents=True, exist_ok=True)
+pathlib.Path(DEVICES_SETTINGS_DIR).mkdir(parents=True, exist_ok=True)
+
 
 class Device:
     def __init__(self, serial: str, logs_enabled: bool = False, logs_filter: str = ''):

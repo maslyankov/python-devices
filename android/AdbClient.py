@@ -1,5 +1,6 @@
 # Uses https://github.com/Swind/pure-python-adb
-from subprocess import PIPE, Popen, CREATE_NEW_CONSOLE, CREATE_NO_WINDOW
+import typing
+from subprocess import PIPE, Popen
 from time import sleep
 from threading import Thread
 import logging
@@ -13,8 +14,15 @@ from utils import compare_sets
 from android.ADBDevice import ADBDevice
 import Client
 
-ADB = "adb.exe"
-SCRCPY = "scrcpy.exe"
+try:
+    from subprocess import CREATE_NEW_CONSOLE, CREATE_NO_WINDOW
+except ImportError:
+    # Not a windows machine
+    CREATE_NEW_CONSOLE = 0
+    CREATE_NO_WINDOW = 0
+
+ADB = "adb"
+SCRCPY = "scrcpy"
 
 
 class AdbClient(Client.Client):
@@ -22,19 +30,20 @@ class AdbClient(Client.Client):
     AdbClient class takes care of starting ADB, keeping connected devices list and etc.
     """
 
-    def __init__(self, callbacks=None, wait_for_gui=False):
+    def __init__(self, callbacks: dict[str, typing.Callable] = None, wait_for_gui: bool = False, adb_binary: str = ADB):
         super().__init__(
             callbacks=callbacks, wait_for_gui=wait_for_gui
         )
+        self._adb_binary = adb_binary
 
         logging.log(logging.INFO, "Starting the ADB Server...")
         try:
             self.adb = Popen(
-                [ADB, 'start-server'],
+                [adb_binary, 'start-server'],
                 stdin=PIPE,
                 stdout=PIPE,
                 stderr=PIPE)
-            self.adb.stdin.close()
+            # self.adb.stdin.close()
             stdout, stderr = self.adb.communicate()
             if stdout:
                 logging.log(logging.DEBUG, f"ADB Start Output: {stdout.decode()}")
@@ -43,36 +52,59 @@ class AdbClient(Client.Client):
             self.adb.wait()
         except FileNotFoundError:
             logging.critical("Fatal error: adb not found!")
-            logging.log(logging.INFO, f"Adb is set to: {ADB}")
+            logging.log(logging.INFO, f"Adb is set to: {adb_binary}")
             exit(1)
 
-        self.client: AdbPy = AdbPy(host="127.0.0.1", port=5037)
+        self.client: AdbPy = AdbPy()
 
-        self._anticipate_root: bool = False
+        self._run_watchdog: bool = True
+        self._anticipate_root: set = set()
 
     @contextmanager
-    def anticipate_root(self) -> None:
-        self._anticipate_root = True
+    def anticipate_root(self, serial: str) -> None:
+        """
+        A context manager for code that
+        """
+        self._anticipate_root.add(serial)
         yield
-        self._anticipate_root = False
+        self._anticipate_root.remove(serial)
 
     # ----- Main Stuff -----
     def _watchdog(self) -> None:
-        devices_set: set = None
+        """
+        The watchdog itself
+        """
+        devices_set: set = set()
+        started: bool = False
         while True:
-            if self.wait_for_gui:  # Give time for the GUI to load
+            if not self._run_watchdog:
+                break
+
+            while self.wait_for_gui:  # Give time for the GUI to load
                 sleep(1)
-                continue
+            self.callbacks['watchdog_starting'](
+                action='watchdog_starting',
+                type='android',
+                error=False
+            )
 
             try:
                 devices_set: set = self.get_devices()
             except ConnectionResetError:
                 logging.critical('ADB Server connection lost.')
+                self.callbacks['error'](
+                    action='get_devices',
+                    type='android',
+                    error=True
+                )
 
-            if not self._anticipate_root:
-                # logging.log(logging.DEBUG, f"Not minding the device updates as we are anticipating root!")
+            # logging.log(logging.DEBUG, f"Not minding the device updates as we are anticipating root!")
+            try:
                 if len(devices_set) > len(self.connected_devices):  # If New devices found
                     for count, diff_device in enumerate(compare_sets(self.connected_devices, devices_set)):
+                        if diff_device in self._anticipate_root:
+                            continue
+
                         if "connected" in self.callbacks:
                             self.callbacks['connected'](
                                 action='connected',
@@ -82,6 +114,9 @@ class AdbClient(Client.Client):
                             )
                 elif len(devices_set) < len(self.connected_devices):  # If a device has disconnected
                     for count, diff_device in enumerate(compare_sets(self.connected_devices, devices_set)):
+                        if diff_device in self._anticipate_root:
+                            continue
+
                         if "connected" in self.callbacks:
                             self.callbacks['disconnected'](
                                 action='disconnected',
@@ -90,13 +125,38 @@ class AdbClient(Client.Client):
                                 error=False
                             )
                 self.connected_devices = devices_set
+            except (TimeoutError, RuntimeError) as e:
+                self.callbacks['error'](
+                    action='get_devices',
+                    type='android',
+                    error=True,
+                    details=e
+                )
+            else:
+                if not started:
+                    self.callbacks['watchdog_started'](
+                        action='watchdog_started',
+                        type='android',
+                        error=False
+                    )
+
+                started = True
 
         logging.log(logging.DEBUG, "ADB Watchdog exiting...")
 
     def watchdog(self) -> None:
+        """
+        Starts the adb watchdog thread.
+        """
         self.watchdog_thread = Thread(target=self._watchdog, args=(), daemon=True)
         self.watchdog_thread.name = 'ADBDevices-Watchdog'
         self.watchdog_thread.start()
+
+    def kill_watchdog(self) -> None:
+        """
+        Kills the Watchdog thread
+        """
+        self._run_watchdog = False
 
     # ----- Getters -----
     def get_devices(self) -> set:
@@ -135,7 +195,7 @@ class AdbClient(Client.Client):
 
         self.devices_obj[device_serial].set_led_color('0FFF00', 'RGB1', 'global_rgb')  # Poly
 
-    def detach_device(self, device_serial) -> None:
+    def detach_device(self, device_serial: str) -> None:
         """
         Remove device from attached devices
         :param device_serial: Device serial
@@ -166,7 +226,7 @@ class AdbClient(Client.Client):
                 logging.exception(e)
                 logging.log(logging.DEBUG, self.attached_devices)
 
-    def reboot_and_wait_for_device(self, device_serial) -> ADBDevice:
+    def reboot_and_wait_for_device(self, device_serial: str) -> typing.Optional[ADBDevice]:
         if device_serial not in self.connected_devices:
             logging.log(logging.ERROR, f"{device_serial} does not seem to be connected to the computer...")
             return
@@ -183,7 +243,7 @@ class AdbClient(Client.Client):
 
         return self.attach_device(device_serial)
 
-    def root(self, device_serial):
+    def root(self, device_serial: str) -> None:
         """
         Root the device
         :return:None
@@ -191,10 +251,10 @@ class AdbClient(Client.Client):
         logging.log(logging.INFO, f"Rooting device {device_serial}")
 
         logging.log(logging.DEBUG, "set ant root on")
-        with self.anticipate_root():
+        with self.anticipate_root(device_serial):
             # CREATE_NO_WINDOW = 0x08000000
             try:
-                root = Popen([ADB, '-s', device_serial, 'root'],
+                root = Popen([self._adb_binary, '-s', device_serial, 'root'],
                              stdin=PIPE,
                              stdout=PIPE,
                              stderr=PIPE,
@@ -221,7 +281,7 @@ class AdbClient(Client.Client):
                 logging.log(logging.CRITICAL, f"Could not find ADB")
 
     @staticmethod
-    def remount(self, device_serial):
+    def remount(self, device_serial) -> None:
         """
         Remount the device
         :return:None
@@ -229,8 +289,8 @@ class AdbClient(Client.Client):
         logging.log(logging.INFO, f"Remount device serial: {device_serial}")
         # CREATE_NO_WINDOW = 0x08000000
         try:
-            with self.anticipate_root():
-                remount = Popen([ADB, '-s', device_serial, 'remount'],
+            with self.anticipate_root(device_serial):
+                remount = Popen([self._adb_binary, '-s', device_serial, 'remount'],
                                 stdin=PIPE,
                                 stdout=PIPE,
                                 stderr=PIPE,
@@ -245,15 +305,15 @@ class AdbClient(Client.Client):
         except FileNotFoundError:
             logging.log(logging.CRITICAL, f"Could not find ADB")
 
-    def disable_verity(self, device_serial):
+    def disable_verity(self, device_serial: str) -> None:
         """
         Disabled verity of device
         :return:None
         """
         logging.log(logging.INFO, f"Disabling verity device serial: {device_serial}")
         # CREATE_NO_WINDOW = 0x08000000
-        with self.anticipate_root():
-            disver = Popen([ADB, '-s', device_serial, 'disable-verity'],
+        with self.anticipate_root(device_serial):
+            disver = Popen([self._adb_binary, '-s', device_serial, 'disable-verity'],
                            stdin=PIPE,
                            stdout=PIPE,
                            stderr=PIPE,
@@ -269,14 +329,13 @@ class AdbClient(Client.Client):
             logging.log(logging.INFO, 'Rebooting device after disabling verity!')
             # self.reboot()
 
-    @staticmethod
-    def open_shell(device_serial, cmd_str: str = None):
+    def open_shell(self, device_serial: str, cmd_str: str = None) -> Popen:
         """
         Open shell terminal of device
         :return:None
         """
         logging.log(logging.INFO, f"Opening shell terminal of: {device_serial}")
-        args_list = [ADB, "-s", device_serial, "shell"]
+        args_list = [self._adb_binary, "-s", device_serial, "shell"]
 
         if cmd_str:
             if isinstance(cmd_str, str):
@@ -288,14 +347,14 @@ class AdbClient(Client.Client):
         return Popen(args_list, creationflags=CREATE_NEW_CONSOLE)
 
     @staticmethod
-    def close_shell(subp: Popen):
+    def close_shell(subp: Popen) -> None:
         try:
             kill(subp.pid, SIGINT)
         except PermissionError:
             pass  # Happens when window does not exits, for ex: did not open at all
     
     @staticmethod
-    def open_device_ctrl(device_obj, extra_args=None):
+    def open_device_ctrl(device_obj, extra_args=None) -> None:
         """
         Open device screen view and control using scrcpy
         :return:None
@@ -324,7 +383,7 @@ class AdbClient(Client.Client):
         # self.scrcpy[-1].stdin.close()
     
     @staticmethod
-    def kill_scrcpy(device_obj):
+    def kill_scrcpy(device_obj: ADBDevice) -> None:
         logging.log(logging.DEBUG, f"Scrcpy list: {device_obj.scrcpy}")
         scrcpy_list = device_obj.scrcpy.copy()
 

@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from re import compile, match
 import logging
+import typing
 
 from Device import Device
 from utils import get_file_paths
@@ -15,14 +16,6 @@ XML_DIR = 'XML'
 Path(XML_DIR).mkdir(parents=True, exist_ok=True)
 # Action types
 ACT_SEQUENCES = {
-    'goto_photo': 'goto_photo_seq',
-    'photo': 'shoot_photo_seq',
-    'goto_video': 'goto_video_seq',
-    'video_start': 'start_video_seq',
-    'video_stop': 'stop_video_seq'
-}
-
-ACT_SEQUENCES_DESC = {
     'goto_photo': 'Change Mode to Photo',
     'photo': 'Shoot Photo',
     'goto_video': 'Change Mode to Video',
@@ -45,7 +38,6 @@ def generate_sequence(subelem):
         action_list = []
         data_list = []
 
-        # self.shoot_photo_seq.append(action.tag)
         for action_elem_num, action_elem in enumerate(action):
             # import pdb; pdb.set_trace()
             logging.debug(f"action elem: {action_elem}")
@@ -127,25 +119,20 @@ class ADBDevice(Device):
         )
 
         # Object Parameters #
-        self.scrcpy = dict()
-
         # Settings
-        self.camera_app = None
-        self.images_save_loc = None
+        self.camera_app: str = ""
+        self.images_save_loc: str = ""
 
         # States
-        self.current_camera_app_mode = 'photo'
+        self.current_camera_app_mode: str = 'photo'
 
         # Sequences
-        self.shoot_photo_seq = []
-        self.start_video_seq = []
-        self.stop_video_seq = []
-        self.goto_photo_seq = []
-        self.goto_video_seq = []
+        self.actions_sequences: dict[str, list] = dict()
         self.actions_time_gap = 1
 
         # Persistence
         self.adb = client
+        self.scrcpy: list[Popen] = list()
 
         self.root()  # Make sure we are using root for device
 
@@ -295,23 +282,12 @@ class ADBDevice(Device):
             return False
 
     # ----- Getters/Setters -----
-    def set_shoot_photo_seq(self, seq):
-        self.shoot_photo_seq = seq
+    def set_sequence(self, seq: str, value: list) -> list:
+        self.actions_sequences[seq] = value
+        return value
 
-    def get_shoot_photo_seq(self):
-        return self.shoot_photo_seq
-
-    def set_start_video_seq(self, seq):
-        self.start_video_seq = seq
-
-    def get_start_video_seq(self):
-        return self.start_video_seq
-
-    def set_stop_video_seq(self, seq):
-        self.stop_video_seq = seq
-
-    def get_stop_video_seq(self):
-        return self.stop_video_seq
+    def get_sequence(self, seq: str):
+        return self.actions_sequences.get(seq, None)
 
     def set_camera_app_pkg(self, pkg):
         self.camera_app = pkg
@@ -474,7 +450,7 @@ class ADBDevice(Device):
                 continue
             files_list[i] = f.strip()
 
-        logging.log("DEBUG", f"Files List After strip: {files_list}")
+        logging.log(logging.DEBUG, f"Files List After strip: {files_list}")
 
         try:
             check_for_missing_dir = files_list[0]
@@ -488,8 +464,6 @@ class ADBDevice(Device):
             return files_list
 
     def get_files_and_folders(self, target_dir):
-        global item_size, item_link_endpoint, total_size
-
         total_size = None
         files_list = self.get_files_list(target_dir, extra_args=['-l'])
         # links: lrwxrwxrwx root     root              1970-01-01 02:00 fg_algo_cos -> /sbin/fg_algo_cos
@@ -632,7 +606,7 @@ class ADBDevice(Device):
         try:
             return self.exec_shell("dumpsys activity | grep -E 'mWakefulness'").split('=')[1]
         except IndexError:
-            logging.warn('There was an issue with getting device wakefullness - probably a shell error!')
+            logging.warning('There was an issue with getting device wakefullness - probably a shell error!')
             return None
 
     def get_device_leds(self):
@@ -782,7 +756,7 @@ class ADBDevice(Device):
                     elif filetype == 'file':
                         self.pull_file(file, path.join(save_dest, filename))
                     else:
-                        logging.warn(f"File {file} is {filetype}. Idk what to do with it...")
+                        logging.warning(f"File {file} is {filetype}. Idk what to do with it...")
                 else:
                     logging.log(logging.ERROR, f"Couldn't get filetype for '{file}' :(")
             else:
@@ -835,12 +809,15 @@ class ADBDevice(Device):
             filename = path.basename(file)
             self.push_file(path.normpath(file), files_dest + filename)
 
-    def turn_on_and_unlock(self):
-        state = self.is_sleeping()
-        if state is None:
-            return
+    def turn_on_and_unlock(self, skip_state_check: bool = False) -> None:
+        if not skip_state_check:
+            state = self.is_sleeping()
+            if state is None:
+                # Probably it's already unlocked and awake?
+                logging.error("Probably the device is already unlocked and awake?")
+                return
 
-        if state[0] == 'true':
+        if skip_state_check or state[0] == 'true':
             self.exec_shell('input keyevent 26')  # Event Power Button
             self.exec_shell('input keyevent 82')  # Unlock
 
@@ -855,9 +832,9 @@ class ADBDevice(Device):
         """
         try:
             self.exec_shell('echo {} > /sys/class/leds/{}/{}'.format(value, led, target))
-            self.exec_shell('echo 60 > /sys/class/leds/{}/global_enable'.format(led))  # Poly
+            self.exec_shell('echo 60 > /sys/class/leds/{}/global_enable'.format(led))
         except RuntimeError:
-            logging.warn("Device was disconnected before we could detach it properly.. :(")
+            logging.warning("Device was disconnected before we could detach it properly.. :(")
 
     def identify(self):
         """
@@ -867,20 +844,18 @@ class ADBDevice(Device):
         leds = self.get_device_leds()
         logging.debug(f"Device leds: {leds}")  # Debugging
 
-        # Poly
         self.exec_shell('echo 1 > /sys/class/leds/{}/global_onoff'.format(leds[0]))
 
         for k in range(1, 60, 5):  # Blink Leds and screen
-            # Poly
             if k != 1:
                 sleep(0.3)
-            self.exec_shell('echo {}{}{} > /sys/class/leds/{}/global_enable'.format(k, k, k, leds[0]))  # Poly
+            self.exec_shell('echo {}{}{} > /sys/class/leds/{}/global_enable'.format(k, k, k, leds[0]))
 
             # Devices with screen
             if (k % 11) % 2:
                 self.exec_shell('input keyevent 26')  # Event Power Button
 
-        self.exec_shell('echo 60 > /sys/class/leds/{}/global_enable'.format(leds[0]))  # Poly
+        self.exec_shell('echo 60 > /sys/class/leds/{}/global_enable'.format(leds[0]))
         logging.log(logging.INFO, 'Finished identifying!')
 
     # ----- Settings Persistence -----
@@ -915,9 +890,9 @@ class ADBDevice(Device):
                             self.logs_filter = data.text if data.text is not None else ''
 
                 for seq_type in list(ACT_SEQUENCES.keys()):
-                    if subelem.tag == ACT_SEQUENCES[seq_type]:
-                        setattr(self, ACT_SEQUENCES[seq_type], generate_sequence(subelem))
-                        logging.debug(f'Device Obj Seq List: {getattr(self, ACT_SEQUENCES[seq_type])}')
+                    if subelem.tag == seq_type:
+                        self.set_sequence(seq_type, generate_sequence(subelem))
+                        logging.debug(f'Device Obj New Seq : {self.get_sequence(seq_type)}')
 
                 if subelem.tag == 'actions_time_gap':
                     self.actions_time_gap = int(subelem.text)
@@ -993,8 +968,8 @@ class ADBDevice(Device):
         logs_filter.text = self.logs_filter
 
         for seq_type in list(ACT_SEQUENCES.keys()):
-            curr_seq = ET.SubElement(settings, ACT_SEQUENCES[seq_type])
-            xml_from_sequence(self, ACT_SEQUENCES[seq_type], curr_seq)
+            curr_seq = ET.SubElement(settings, seq_type)
+            xml_from_sequence(self, seq_type, curr_seq)
 
         actions_time_gap = ET.SubElement(settings, "actions_time_gap")
         actions_time_gap.text = str(self.actions_time_gap)
@@ -1015,7 +990,8 @@ class ADBDevice(Device):
         """
         Dump elements of currently opened app activity window
         and pull them from device to folder XML
-        :return:None
+        :return:
+        None
         """
         source = self.exec_shell('uiautomator dump').split(': ')[1].rstrip()
         current_app = self.get_current_app()
@@ -1032,11 +1008,13 @@ class ADBDevice(Device):
         )
         logging.log(logging.INFO, 'Dumped window elements for current app.')
 
-    def get_clickable_window_elements(self, force_dump=False) -> list:
+    def get_clickable_window_elements(self, force_dump=False) -> dict:
         """
         Parse the dumped window elements file and filter only elements that are "clickable"
-        :return:Dict key: element_id or number,
-                value: String of elem description, touch location (a list of x and y)
+        :return:
+        Dict
+            key: element_id or number,
+            value: String of elem description, touch location (a list of x and y)
         """
         logging.debug('Parsing UI XML...')
         current_app = self.get_current_app()
@@ -1073,7 +1051,7 @@ class ADBDevice(Device):
             logging.log(logging.ERROR, "XML wasn't opened correctly!")
             return {}
         except UnboundLocalError:
-            logging.warn("UI Elements XML is probably empty... :( Retrying...")
+            logging.warning("UI Elements XML is probably empty... :( Retrying...")
             self.dump_window_elements()
             xml_tree = ET.parse(file)
             xml_root = xml_tree.getroot()
@@ -1125,21 +1103,21 @@ class ADBDevice(Device):
     def take_photo(self):
         logging.debug(f"Current mode: {self.current_camera_app_mode}")
         if self.current_camera_app_mode != 'photo':
-            self.do(self.goto_photo_seq)
+            self.do(self.get_sequence("goto_photo"))
             self.current_camera_app_mode = 'photo'
-        self.do(self.shoot_photo_seq)
+        self.do(self.get_sequence("shoot_photo"))
 
     def start_video(self):
         logging.debug(f"Current mode: {self.current_camera_app_mode}")
         if self.current_camera_app_mode != 'video':
-            self.do(self.goto_video_seq)
+            self.do(self.get_sequence("goto_video"))
             self.current_camera_app_mode = 'video'
             self.is_recording_video = True
-        self.do(self.start_video_seq)
+        self.do(self.get_sequence("start_video"))
 
     def stop_video(self):
         if self.is_recording_video:
-            self.do(self.stop_video_seq)
+            self.do(self.get_sequence("stop_video"))
 
     # ----- Other -----
     def print_attributes(self):
@@ -1150,10 +1128,6 @@ class ADBDevice(Device):
         logging.debug(f"Cam app: {self.camera_app}")
         logging.debug(f"images save path: {self.images_save_loc}")
         logging.debug(f"Logs enabled: ({self.logs_enabled}), filter ({self.logs_filter})")
-        logging.debug(f"shoot_photo_seq: {self.shoot_photo_seq}")
-        logging.debug(f"start_video_seq: {self.start_video_seq}")
-        logging.debug(f"stop_video_seq: {self.stop_video_seq}")
-        logging.debug(f"goto_photo_seq: {self.goto_photo_seq}")
-        logging.debug(f"goto_video_seq: {self.goto_video_seq}")
+        logging.debug(f"shoot_photo_seq: {self.actions_sequences}")
         logging.debug(f"actions_time_gap: {self.actions_time_gap}")
         logging.debug(f"settings xml file location: {self.device_xml}")
